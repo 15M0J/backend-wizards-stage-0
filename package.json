@@ -1,5 +1,5 @@
 {
-  "name": "backend-wizards-stage-0",
+  "name": "api-practice-lab",
   "version": "1.0.0",
   "description": "Stage 0 API integration and data processing assessment",
   "main": "server.js",
