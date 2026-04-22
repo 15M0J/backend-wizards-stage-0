@@ -1,6 +1,5 @@
 const express = require("express");
 const axios = require("axios");
-const { randomBytes } = require("crypto");
 const {
   ConfigurationError,
   ensureDatabaseReady,
@@ -10,10 +9,37 @@ const {
   getProfileByName,
   listProfiles
 } = require("./db");
+const { parseNaturalLanguageQuery } = require("./naturalLanguageParser");
+const {
+  AGE_GROUPS,
+  GENDERS,
+  generateUuidV7,
+  getAgeGroup,
+  getCountryName,
+  isUuidV7,
+  normalizeFilter,
+  normalizeName
+} = require("./profileUtils");
 
 const GENDERIZE_API = "https://api.genderize.io";
 const AGIFY_API = "https://api.agify.io";
 const NATIONALIZE_API = "https://api.nationalize.io";
+
+const PROFILE_QUERY_PARAMS = new Set([
+  "gender",
+  "age_group",
+  "country_id",
+  "min_age",
+  "max_age",
+  "min_gender_probability",
+  "min_country_probability",
+  "sort_by",
+  "order",
+  "page",
+  "limit"
+]);
+const SEARCH_QUERY_PARAMS = new Set(["q", "page", "limit"]);
+const SORTABLE_FIELDS = new Set(["age", "created_at", "gender_probability"]);
 
 class UpstreamValidationError extends Error {
   constructor(apiName) {
@@ -22,55 +48,191 @@ class UpstreamValidationError extends Error {
   }
 }
 
-function normalizeName(name) {
-  return name.trim().toLowerCase();
-}
-
-function normalizeFilter(value) {
-  return value.trim().toLowerCase();
+class QueryValidationError extends Error {
+  constructor(statusCode = 422, message = "Invalid query parameters") {
+    super(message);
+    this.statusCode = statusCode;
+  }
 }
 
 function isInvalidStringValue(value) {
   return Array.isArray(value) || (value !== undefined && typeof value !== "string");
 }
 
-function getAgeGroup(age) {
-  if (age <= 12) {
-    return "child";
+function assertNoUnknownQueryParameters(query, allowedParameters) {
+  for (const key of Object.keys(query)) {
+    if (!allowedParameters.has(key)) {
+      throw new QueryValidationError(400);
+    }
   }
-
-  if (age <= 19) {
-    return "teenager";
-  }
-
-  if (age <= 59) {
-    return "adult";
-  }
-
-  return "senior";
 }
 
-function generateUuidV7() {
-  const bytes = randomBytes(16);
-  let timestamp = BigInt(Date.now());
+function getQueryString(query, key, { required = false } = {}) {
+  const value = query[key];
 
-  for (let index = 5; index >= 0; index -= 1) {
-    bytes[index] = Number(timestamp & 0xffn);
-    timestamp >>= 8n;
+  if (value === undefined) {
+    if (required) {
+      throw new QueryValidationError(400, "Missing or empty parameter");
+    }
+
+    return undefined;
   }
 
-  bytes[6] = (bytes[6] & 0x0f) | 0x70;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  if (Array.isArray(value) || typeof value !== "string") {
+    throw new QueryValidationError(422);
+  }
 
-  const hex = bytes.toString("hex");
+  const trimmed = value.trim();
 
-  return [
-    hex.slice(0, 8),
-    hex.slice(8, 12),
-    hex.slice(12, 16),
-    hex.slice(16, 20),
-    hex.slice(20, 32)
-  ].join("-");
+  if (trimmed === "") {
+    throw new QueryValidationError(
+      400,
+      required ? "Missing or empty parameter" : "Invalid query parameters"
+    );
+  }
+
+  return trimmed;
+}
+
+function parseIntegerParameter(query, key, options = {}) {
+  const value = getQueryString(query, key);
+
+  if (value === undefined) {
+    return options.defaultValue;
+  }
+
+  if (!/^\d+$/.test(value)) {
+    throw new QueryValidationError(422);
+  }
+
+  const parsed = Number(value);
+
+  if (
+    !Number.isSafeInteger(parsed) ||
+    (options.min !== undefined && parsed < options.min) ||
+    (options.max !== undefined && parsed > options.max)
+  ) {
+    throw new QueryValidationError(422);
+  }
+
+  return parsed;
+}
+
+function parseProbabilityParameter(query, key) {
+  const value = getQueryString(query, key);
+
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!/^(?:0(?:\.\d+)?|1(?:\.0+)?)$/.test(value)) {
+    throw new QueryValidationError(422);
+  }
+
+  return Number(value);
+}
+
+function parsePagination(query) {
+  return {
+    page: parseIntegerParameter(query, "page", { defaultValue: 1, min: 1 }),
+    limit: parseIntegerParameter(query, "limit", {
+      defaultValue: 10,
+      min: 1,
+      max: 50
+    })
+  };
+}
+
+function validateFilters(filters) {
+  if (filters.gender !== undefined && !GENDERS.has(filters.gender)) {
+    throw new QueryValidationError(422);
+  }
+
+  if (filters.age_group !== undefined && !AGE_GROUPS.has(filters.age_group)) {
+    throw new QueryValidationError(422);
+  }
+
+  if (
+    filters.country_id !== undefined &&
+    !/^[A-Z]{2}$/.test(filters.country_id)
+  ) {
+    throw new QueryValidationError(422);
+  }
+
+  if (
+    filters.min_age !== undefined &&
+    filters.max_age !== undefined &&
+    filters.min_age > filters.max_age
+  ) {
+    throw new QueryValidationError(422);
+  }
+}
+
+function parseListOptions(query) {
+  assertNoUnknownQueryParameters(query, PROFILE_QUERY_PARAMS);
+
+  const filters = {};
+  const gender = getQueryString(query, "gender");
+  const ageGroup = getQueryString(query, "age_group");
+  const countryId = getQueryString(query, "country_id");
+  const sortBy = (getQueryString(query, "sort_by") || "created_at").toLowerCase();
+  const order = (getQueryString(query, "order") || "asc").toLowerCase();
+
+  if (gender !== undefined) {
+    filters.gender = normalizeFilter(gender);
+  }
+
+  if (ageGroup !== undefined) {
+    filters.age_group = normalizeFilter(ageGroup);
+  }
+
+  if (countryId !== undefined) {
+    filters.country_id = countryId.toUpperCase();
+  }
+
+  filters.min_age = parseIntegerParameter(query, "min_age", { min: 0, max: 130 });
+  filters.max_age = parseIntegerParameter(query, "max_age", { min: 0, max: 130 });
+  filters.min_gender_probability = parseProbabilityParameter(
+    query,
+    "min_gender_probability"
+  );
+  filters.min_country_probability = parseProbabilityParameter(
+    query,
+    "min_country_probability"
+  );
+
+  if (!SORTABLE_FIELDS.has(sortBy) || !["asc", "desc"].includes(order)) {
+    throw new QueryValidationError(422);
+  }
+
+  validateFilters(filters);
+
+  return {
+    filters,
+    sort_by: sortBy,
+    order,
+    ...parsePagination(query)
+  };
+}
+
+function parseSearchOptions(query) {
+  assertNoUnknownQueryParameters(query, SEARCH_QUERY_PARAMS);
+
+  const q = getQueryString(query, "q", { required: true });
+  const filters = parseNaturalLanguageQuery(q);
+
+  if (!filters) {
+    throw new QueryValidationError(400, "Unable to interpret query");
+  }
+
+  validateFilters(filters);
+
+  return {
+    filters,
+    sort_by: "created_at",
+    order: "asc",
+    ...parsePagination(query)
+  };
 }
 
 async function fetchGender(name) {
@@ -90,7 +252,7 @@ async function fetchGender(name) {
   const sampleSize = Number(count);
 
   if (
-    gender === null ||
+    !GENDERS.has(gender) ||
     sampleSize === 0 ||
     Number.isNaN(genderProbability) ||
     Number.isNaN(sampleSize)
@@ -100,8 +262,7 @@ async function fetchGender(name) {
 
   return {
     gender,
-    gender_probability: genderProbability,
-    sample_size: sampleSize
+    gender_probability: genderProbability
   };
 }
 
@@ -159,7 +320,7 @@ async function fetchNationality(name) {
     return highest;
   }, null);
 
-  const countryId = bestMatch?.country_id;
+  const countryId = bestMatch?.country_id?.toUpperCase();
   const countryProbability = Number(bestMatch?.probability);
 
   if (!countryId || Number.isNaN(countryProbability)) {
@@ -168,6 +329,7 @@ async function fetchNationality(name) {
 
   return {
     country_id: countryId,
+    country_name: getCountryName(countryId),
     country_probability: countryProbability
   };
 }
@@ -184,12 +346,11 @@ async function buildProfile(name) {
     name,
     gender: genderData.gender,
     gender_probability: genderData.gender_probability,
-    sample_size: genderData.sample_size,
     age: ageData.age,
     age_group: ageData.age_group,
     country_id: nationalityData.country_id,
-    country_probability: nationalityData.country_probability,
-    created_at: new Date().toISOString()
+    country_name: nationalityData.country_name,
+    country_probability: nationalityData.country_probability
   };
 }
 
@@ -282,8 +443,49 @@ app.post("/api/profiles", async (req, res, next) => {
   }
 });
 
+app.get("/api/profiles/search", async (req, res, next) => {
+  try {
+    const options = parseSearchOptions(req.query);
+    const result = await listProfiles(options);
+
+    return res.status(200).json({
+      status: "success",
+      page: options.page,
+      limit: options.limit,
+      total: result.total,
+      data: result.profiles
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.get("/api/profiles", async (req, res, next) => {
+  try {
+    const options = parseListOptions(req.query);
+    const result = await listProfiles(options);
+
+    return res.status(200).json({
+      status: "success",
+      page: options.page,
+      limit: options.limit,
+      total: result.total,
+      data: result.profiles
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
 app.get("/api/profiles/:id", async (req, res, next) => {
   try {
+    if (!isUuidV7(req.params.id)) {
+      return res.status(404).json({
+        status: "error",
+        message: "Profile not found"
+      });
+    }
+
     const profile = await getProfileById(req.params.id);
 
     if (!profile) {
@@ -302,46 +504,15 @@ app.get("/api/profiles/:id", async (req, res, next) => {
   }
 });
 
-app.get("/api/profiles", async (req, res, next) => {
+app.delete("/api/profiles/:id", async (req, res, next) => {
   try {
-    const { gender, country_id: countryId, age_group: ageGroup } = req.query;
-
-    if (
-      isInvalidStringValue(gender) ||
-      isInvalidStringValue(countryId) ||
-      isInvalidStringValue(ageGroup)
-    ) {
-      return res.status(422).json({
+    if (!isUuidV7(req.params.id)) {
+      return res.status(404).json({
         status: "error",
-        message: "Invalid type"
+        message: "Profile not found"
       });
     }
 
-    const profiles = await listProfiles({
-      gender: gender ? normalizeFilter(gender) : undefined,
-      country_id: countryId ? normalizeFilter(countryId) : undefined,
-      age_group: ageGroup ? normalizeFilter(ageGroup) : undefined
-    });
-
-    return res.status(200).json({
-      status: "success",
-      count: profiles.length,
-      data: profiles.map((profile) => ({
-        id: profile.id,
-        name: profile.name,
-        gender: profile.gender,
-        age: profile.age,
-        age_group: profile.age_group,
-        country_id: profile.country_id
-      }))
-    });
-  } catch (error) {
-    return next(error);
-  }
-});
-
-app.delete("/api/profiles/:id", async (req, res, next) => {
-  try {
     const deleted = await deleteProfileById(req.params.id);
 
     if (!deleted) {
@@ -358,6 +529,13 @@ app.delete("/api/profiles/:id", async (req, res, next) => {
 });
 
 app.use((error, req, res, next) => {
+  if (error instanceof QueryValidationError) {
+    return res.status(error.statusCode).json({
+      status: "error",
+      message: error.message
+    });
+  }
+
   if (error instanceof UpstreamValidationError) {
     return res.status(502).json({
       status: "error",
